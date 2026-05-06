@@ -1,0 +1,20 @@
+{
+  "default": {
+    "key": "default",
+    "name": "Default",
+    "bannerUrl": "/bg.jpg",
+    "redirectUrl": "http://diag.vn/panel/tam-soat-ung-thu-toan-dien/?utm_source=offline&utm_medium=wifi-banner&utm_campaign=wellness-elite_0326",
+    "minutes": 1440
+  },
+  "branches": [
+    {
+      "key": "D051-ThaoDien-HCM",
+      "name": "D051 ThaoDien HCM",
+      "apNames": ["D051-ThaoDien-HCM"],
+      "apMacs": ["9c:05:d6:7c:00:e9"],
+      "bannerUrl": "/assets/branches/D051-ThaoDien-HCM/khaitruong.jpg",
+      "redirectUrl": "http://diag.vn/chuong-trinh-khuyen-mai/?utm_source=offline&utm_medium=wifi-banner&utm_campaign=30%-panels-go-d051_0526",
+      "minutes": 1440
+    }
+  ]
+}

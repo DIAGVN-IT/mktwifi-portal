@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="vi">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>DIAG WiFi</title>
+    <style>
+        :root {
+            --safe-bottom: env(safe-area-inset-bottom, 0px);
+            --pad: 18px;
+            --card-radius: 16px;
+            --hero-radius: 24px;
+            --hero-max-h: 70vh;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            min-height: 100dvh;
+            font-family: Arial, sans-serif;
+            color: #fff;
+            background: #000;
+            overflow-x: hidden;
+        }
+
+        .bg-blur {
+            display: block;
+            position: fixed;
+            inset: 0;
+            background: var(--banner-url, url("/bg.jpg")) center/cover no-repeat;
+            filter: blur(18px) brightness(0.65);
+            transform: scale(1.08);
+            z-index: 0;
+        }
+
+        .hero-wrap {
+            display: flex;
+            position: fixed;
+            inset: 0;
+            align-items: center;
+            justify-content: center;
+            z-index: 1;
+            pointer-events: none;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        .hero-box {
+            pointer-events: none;
+            display: inline-flex;
+            flex-direction: column;
+            align-items: stretch;
+            max-width: 100vw;
+            max-height: 100dvh;
+        }
+
+        .hero-img {
+            display: block;
+            width: 100%;
+            height: auto;
+            max-width: 100%;
+            max-height: var(--hero-max-h);
+            object-fit: contain;
+            border-radius: var(--hero-radius);
+            box-shadow: 0 30px 80px rgba(0,0,0,0.55);
+        }
+
+        .wrap {
+            position: fixed;
+            inset: 0;
+            z-index: 3;
+            pointer-events: none;
+        }
+
+        .card {
+            pointer-events: auto;
+            width: 100%;
+            box-sizing: border-box;
+            background: rgba(0,0,0,0.45);
+            backdrop-filter: blur(3px);
+            border: 1px solid rgba(255,255,255,0.15);
+            padding: 14px 14px calc(14px + var(--safe-bottom));
+            border-radius: var(--card-radius);
+            margin-top: 10px;
+        }
+
+        .title {
+            font-size: 22px;
+            font-weight: 700;
+            margin: 0 0 10px 0;
+            text-align: center;
+        }
+
+        .sub {
+            margin: 0 0 16px 0;
+            opacity: 0.9;
+            text-align: center;
+            font-size: 14px;
+        }
+
+        .btn {
+            width: 100%;
+            border: 0;
+            border-radius: 14px;
+            padding: 14px 14px;
+            font-size: 18px;
+            font-weight: 700;
+            color: #fff;
+            background: #1976ff;
+            cursor: pointer;
+        }
+
+        .btn:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+        }
+
+        .progress {
+            margin-top: 14px;
+            height: 10px;
+            background: rgba(255,255,255,0.18);
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .bar {
+            height: 100%;
+            width: 0%;
+            background: rgba(255,255,255,0.95);
+            transition: width 180ms linear;
+        }
+
+        #dbg {
+            margin-top: 10px;
+            font-size: 13px;
+            opacity: 0.65;
+            text-align: center;
+            word-break: break-word;
+        }
+
+        @media (min-width: 1024px) {
+            .hero-wrap {
+                padding: 4vh 4vw;
+            }
+
+            .hero-box {
+                max-width: 90vw;
+                max-height: 90vh;
+            }
+
+            .hero-img {
+                max-width: 90vw;
+            }
+
+            .card {
+                padding: 16px 18px calc(16px + var(--safe-bottom));
+                margin-top: 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-blur"></div>
+
+    <div class="hero-wrap">
+        <div class="hero-box">
+            <img src="/bg.jpg" class="hero-img" id="heroImg" />
+            <div class="card">
+                <button class="btn" type="button" onclick="connect()">KẾT NỐI WIFI</button>
+
+                <div class="progress" aria-hidden="true">
+                    <div class="bar" id="bar"></div>
+                </div>
+
+                <div id="dbg"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="wrap"></div>
+
+    <script>
+        function fitHeroLayout() {
+            const heroWrap = document.querySelector(".hero-wrap");
+            const heroBox = document.querySelector(".hero-box");
+            const heroImg = document.querySelector(".hero-img");
+            const card = document.querySelector(".card");
+            if (!heroWrap || !heroBox || !heroImg || !card) return;
+
+            const wrapStyle = getComputedStyle(heroWrap);
+            const padTop = parseFloat(wrapStyle.paddingTop || "0") || 0;
+            const padBottom = parseFloat(wrapStyle.paddingBottom || "0") || 0;
+
+            const gap = parseFloat(getComputedStyle(card).marginTop || "0") || 0;
+
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            const available = vh - padTop - padBottom - card.offsetHeight - gap;
+
+            const safe = 60;
+            const maxH = Math.max(safe, Math.floor(available));
+
+            document.documentElement.style.setProperty("--hero-max-h", maxH + "px");
+        }
+
+        function bindFitHero() {
+            const heroImg = document.querySelector(".hero-img");
+            if (heroImg) {
+                if (heroImg.complete) fitHeroLayout();
+                heroImg.addEventListener("load", fitHeroLayout, { passive: true });
+            }
+            window.addEventListener("resize", fitHeroLayout, { passive: true });
+            window.addEventListener("orientationchange", fitHeroLayout, { passive: true });
+            setTimeout(fitHeroLayout, 30);
+            setTimeout(fitHeroLayout, 200);
+            setTimeout(fitHeroLayout, 800);
+        }
+
+        bindFitHero();
+
+        let busy = false;
+        let portalContext = null;
+
+
+        function setBanner(url) {
+            if (!url) return;
+            const safeUrl = String(url);
+            document.documentElement.style.setProperty("--banner-url", "url('" + safeUrl.replace(/'/g, "%27") + "')");
+            const heroImg = document.getElementById("heroImg");
+            if (heroImg) {
+                heroImg.src = safeUrl;
+                if (heroImg.complete) fitHeroLayout();
+            }
+        }
+
+        async function loadPortalContext() {
+            const mac = (param("id") || "").trim().toLowerCase();
+            const ap = (param("ap") || "").trim().toLowerCase();
+            const siteRef = getSiteRefFromPath();
+
+            const qs = new URLSearchParams();
+            if (mac) qs.set("mac", mac);
+            if (ap) qs.set("ap", ap);
+            if (siteRef) qs.set("site", siteRef);
+
+            try {
+                const r = await fetch("/api/portal-context?" + qs.toString(), { method: "GET" });
+                const j = await r.json().catch(() => null);
+                if (j && j.branch) {
+                    portalContext = j;
+                    setBanner(j.branch.bannerUrl);
+                }
+            } catch (_) { }
+        }
+
+        loadPortalContext();
+
+        function param(name) {
+            const u = new URL(location.href);
+            return u.searchParams.get(name) || "";
+        }
+
+        function getSiteRefFromPath() {
+            const m = location.pathname.match(/\/guest\/s\/([^\/]+)\//i);
+            return m && m[1] ? m[1] : "";
+        }
+
+        function isIOS() {
+            const ua = navigator.userAgent || "";
+            return /iP(hone|ad|od)/i.test(ua);
+        }
+
+        function isCaptiveWebView() {
+            const ua = navigator.userAgent || "";
+            return /CaptiveNetworkSupport/i.test(ua) || /wispr/i.test(ua);
+        }
+
+        function sleep(ms) {
+            return new Promise(r => setTimeout(r, ms));
+        }
+
+        function setBar(v) {
+            const bar = document.getElementById("bar");
+            if (bar) bar.style.width = Math.max(0, Math.min(100, v)) + "%";
+        }
+
+        function fireImage(url) {
+            try {
+                const img = new Image();
+                img.referrerPolicy = "no-referrer";
+                img.src = url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
+            } catch (_) { }
+        }
+
+        function kickNetwork() {
+            fireImage("http://connectivitycheck.gstatic.com/generate_204");
+            fireImage("http://captive.apple.com/hotspot-detect.html");
+            fireImage("http://neverssl.com/");
+        }
+
+        async function authorizeWithRetry(payload, maxRetry = 2, delayMs = 900) {
+            let lastError = null;
+
+            for (let i = 0; i <= maxRetry; i++) {
+                try {
+                    const r = await fetch("/api/authorize", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload)
+                    });
+
+                    const j = await r.json().catch(() => null);
+
+                    if (r.ok && j && j.ok === true) {
+                        return j;
+                    }
+
+                    lastError = j && (j.error || j.message) ? (j.error || j.message) : ("HTTP " + r.status);
+                } catch (e) {
+                    lastError = e && e.message ? e.message : "network_error";
+                }
+
+                if (i < maxRetry) {
+                    await sleep(delayMs);
+                }
+            }
+
+            throw new Error(lastError || "AUTHORIZE_FAILED");
+        }
+
+        async function connect() {
+            if (busy) return;
+            busy = true;
+
+            const dbg = document.getElementById("dbg");
+            const btn = document.querySelector(".btn");
+
+            const mac = (param("id") || "").trim().toLowerCase();
+            const siteRef = getSiteRefFromPath();
+            const ap = (param("ap") || "").trim().toLowerCase();
+
+            if (!portalContext) {
+                await loadPortalContext();
+            }
+
+            const finalUrl = portalContext && portalContext.branch && portalContext.branch.redirectUrl ? portalContext.branch.redirectUrl : "http://diag.vn/panel/tam-soat-ung-thu-toan-dien/?utm_source=offline&utm_medium=wifi-banner&utm_campaign=wellness-elite_0326";
+            const minutes = portalContext && portalContext.branch && Number.isFinite(Number(portalContext.branch.minutes)) ? Number(portalContext.branch.minutes) : 1440;
+
+            if (!mac) {
+                if (dbg) dbg.textContent = "Missing UniFi parameter";
+                busy = false;
+                return;
+            }
+
+            if (btn) btn.disabled = true;
+            if (dbg) dbg.textContent = "Đang kết nối, vui lòng chờ...";
+            setBar(8);
+
+            try {
+                setBar(25);
+
+                await authorizeWithRetry(
+                    { mac: mac, ap: ap, minutes: minutes, site: siteRef },
+                    2,
+                    900
+                );
+
+                setBar(75);
+                if (dbg) dbg.textContent = "Đang hoàn tất kết nối...";
+
+                kickNetwork();
+                await sleep(900);
+
+                setBar(99);
+
+                if (isIOS() && isCaptiveWebView()) {
+                    fireImage("http://captive.apple.com/hotspot-detect.html");
+                    await sleep(500);
+                }
+
+                if (dbg) dbg.textContent = "Đang chuyển trang...";
+                await sleep(350);
+
+                try {
+                    location.replace(finalUrl + (finalUrl.includes("?") ? "&" : "?") + "t=" + Date.now());
+                } catch (_) {
+                    location.href = finalUrl;
+                }
+            } catch (e) {
+                setBar(99);
+                if (dbg) dbg.textContent = "Authorize Failed: " + (e && e.message ? e.message : "unknown");
+                busy = false;
+                if (btn) btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+.env
+certs/
+*.key
+*.pem
+*.p12
+*.crt
+*.cer
+*.log
+node_modules/
