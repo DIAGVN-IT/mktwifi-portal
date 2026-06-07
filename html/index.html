@@ -27,7 +27,7 @@
             display: block;
             position: fixed;
             inset: 0;
-            background: var(--banner-url, url("/bg.jpg")) center/cover no-repeat;
+            background: url("/bg.jpg") center/cover no-repeat;
             filter: blur(18px) brightness(0.65);
             transform: scale(1.08);
             z-index: 0;
@@ -164,7 +164,7 @@
 
     <div class="hero-wrap">
         <div class="hero-box">
-            <img src="/bg.jpg" class="hero-img" id="heroImg" />
+            <img src="/bg.jpg" class="hero-img" />
             <div class="card">
                 <button class="btn" type="button" onclick="connect()">KẾT NỐI WIFI</button>
 
@@ -218,41 +218,6 @@
         bindFitHero();
 
         let busy = false;
-        let portalContext = null;
-
-
-        function setBanner(url) {
-            if (!url) return;
-            const safeUrl = String(url);
-            document.documentElement.style.setProperty("--banner-url", "url('" + safeUrl.replace(/'/g, "%27") + "')");
-            const heroImg = document.getElementById("heroImg");
-            if (heroImg) {
-                heroImg.src = safeUrl;
-                if (heroImg.complete) fitHeroLayout();
-            }
-        }
-
-        async function loadPortalContext() {
-            const mac = (param("id") || "").trim().toLowerCase();
-            const ap = (param("ap") || "").trim().toLowerCase();
-            const siteRef = getSiteRefFromPath();
-
-            const qs = new URLSearchParams();
-            if (mac) qs.set("mac", mac);
-            if (ap) qs.set("ap", ap);
-            if (siteRef) qs.set("site", siteRef);
-
-            try {
-                const r = await fetch("/api/portal-context?" + qs.toString(), { method: "GET" });
-                const j = await r.json().catch(() => null);
-                if (j && j.branch) {
-                    portalContext = j;
-                    setBanner(j.branch.bannerUrl);
-                }
-            } catch (_) { }
-        }
-
-        loadPortalContext();
 
         function param(name) {
             const u = new URL(location.href);
@@ -336,14 +301,9 @@
 
             const mac = (param("id") || "").trim().toLowerCase();
             const siteRef = getSiteRefFromPath();
-            const ap = (param("ap") || "").trim().toLowerCase();
 
-            if (!portalContext) {
-                await loadPortalContext();
-            }
-
-            const finalUrl = portalContext && portalContext.branch && portalContext.branch.redirectUrl ? portalContext.branch.redirectUrl : "http://diag.vn/panel/tam-soat-ung-thu-toan-dien/?utm_source=offline&utm_medium=wifi-banner&utm_campaign=wellness-elite_0326";
-            const minutes = portalContext && portalContext.branch && Number.isFinite(Number(portalContext.branch.minutes)) ? Number(portalContext.branch.minutes) : 1440;
+            const finalUrl = "http://diag.vn/panel/tam-soat-ung-thu-toan-dien/?utm_source=offline&utm_medium=wifi-banner&utm_campaign=wellness-elite_0326";
+            const minutes = 1440;
 
             if (!mac) {
                 if (dbg) dbg.textContent = "Missing UniFi parameter";
@@ -359,8 +319,8 @@
                 setBar(25);
 
                 await authorizeWithRetry(
-                    { mac: mac, ap: ap, minutes: minutes, site: siteRef },
-                    2,
+                    { mac: mac, minutes: minutes, site: siteRef },
+                    0,
                     900
                 );
 
