@@ -1,6 +1,7 @@
 services:
   portal-web:
-    image: nginx:alpine
+    image: nginx:alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
+    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
@@ -9,17 +10,53 @@ services:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./certs:/etc/nginx/certs:ro
     depends_on:
-      - portal-api
+      portal-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/api/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   portal-api:
     build: ./api
+    restart: unless-stopped
     environment:
-      UNIFI_BASE: "${UNIFI_BASE}"
-      UNIFI_API_KEY: "${UNIFI_API_KEY}"
-      UNIFI_SITE: "${UNIFI_SITE}"
-      POST_AUTH_DELAY_MS: "${POST_AUTH_DELAY_MS}"
+      UNIFI_BASE: "${UNIFI_BASE:?UNIFI_BASE is required}"
+      UNIFI_API_KEY: "${UNIFI_API_KEY:?UNIFI_API_KEY is required}"
+      UNIFI_SITE: "${UNIFI_SITE:-default}"
+      POST_AUTH_DELAY_MS: "${POST_AUTH_DELAY_MS:-1500}"
+      UNIFI_REQUEST_TIMEOUT_MS: "${UNIFI_REQUEST_TIMEOUT_MS:-5000}"
+      AUTHORIZE_DEADLINE_MS: "${AUTHORIZE_DEADLINE_MS:-15000}"
+      CLIENT_WAIT_ATTEMPTS: "${CLIENT_WAIT_ATTEMPTS:-12}"
+      CLIENT_WAIT_INTERVAL_MS: "${CLIENT_WAIT_INTERVAL_MS:-750}"
+      AUTH_TIME_LIMIT_MINUTES: "${AUTH_TIME_LIMIT_MINUTES:-240}"
+      AUTH_DATA_USAGE_LIMIT_MBYTES: "${AUTH_DATA_USAGE_LIMIT_MBYTES:-}"
+      AUTH_RX_RATE_LIMIT_KBPS: "${AUTH_RX_RATE_LIMIT_KBPS:-}"
+      AUTH_TX_RATE_LIMIT_KBPS: "${AUTH_TX_RATE_LIMIT_KBPS:-}"
+      AUTH_RATE_LIMIT_WINDOW_MS: "${AUTH_RATE_LIMIT_WINDOW_MS:-60000}"
+      AUTH_RATE_LIMIT_MAX_PER_MAC: "${AUTH_RATE_LIMIT_MAX_PER_MAC:-10}"
+      AUTH_RATE_LIMIT_MAX_GLOBAL: "${AUTH_RATE_LIMIT_MAX_GLOBAL:-600}"
+      AUTH_RATE_LIMIT_MAX_MAC_KEYS: "${AUTH_RATE_LIMIT_MAX_MAC_KEYS:-5000}"
       BRANCH_MAP_PATH: "/app/branch-map.json"
     volumes:
       - ./config/branch-map.json:/app/branch-map.json:ro
     extra_hosts:
       - "diag-unifi.diag.vn:192.168.5.115"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const http = require('http'); const req = http.get('http://127.0.0.1:3000/api/health/live', (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }); req.setTimeout(3000, () => { req.destroy(); process.exit(1); }); req.on('error', () => process.exit(1));\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
