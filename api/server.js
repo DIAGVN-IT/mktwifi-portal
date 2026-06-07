@@ -20,7 +20,11 @@ const parseRequiredPositiveInteger = (name, fallback) => {
   if (!/^[1-9][0-9]*$/.test(value)) {
     throw new Error(`Invalid ${name}`);
   }
-  return Number(value);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return parsed;
 };
 
 const parseOptionalPositiveInteger = (name) => {
@@ -29,7 +33,11 @@ const parseOptionalPositiveInteger = (name) => {
   if (!/^[1-9][0-9]*$/.test(raw)) {
     throw new Error(`Invalid ${name}`);
   }
-  return Number(raw);
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return parsed;
 };
 
 const AUTH_TIME_LIMIT_MINUTES = parseRequiredPositiveInteger("AUTH_TIME_LIMIT_MINUTES", 240);
@@ -164,6 +172,15 @@ const pruneMacWindows = (now) => {
   }
 };
 
+const retryAfterSecondsForEarliestMacWindow = (now) => {
+  let earliestExpiresAt = Infinity;
+  for (const state of macWindowCounts.values()) {
+    earliestExpiresAt = Math.min(earliestExpiresAt, state.startedAt + AUTH_RATE_LIMIT_WINDOW_MS);
+  }
+  if (!Number.isFinite(earliestExpiresAt)) return 1;
+  return Math.max(1, Math.ceil((earliestExpiresAt - now) / 1000));
+};
+
 const checkAuthorizeRateLimit = (mac) => {
   const now = nowMs();
   if (now - globalWindow.startedAt >= AUTH_RATE_LIMIT_WINDOW_MS) {
@@ -186,7 +203,7 @@ const checkAuthorizeRateLimit = (mac) => {
       pruneMacWindows(now);
     }
     if (macWindowCounts.size >= AUTH_RATE_LIMIT_MAX_MAC_KEYS) {
-      return { limited: true, scope: "mac_keys", retryAfterSeconds: 1 };
+      return { limited: true, scope: "mac_keys", retryAfterSeconds: retryAfterSecondsForEarliestMacWindow(now) };
     }
     macState = { startedAt: now, count: 0 };
     macWindowCounts.set(mac, macState);
