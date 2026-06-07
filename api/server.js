@@ -3,7 +3,7 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "4kb" }));
 
 const UNIFI_BASE = process.env.UNIFI_BASE;
 const UNIFI_API_KEY = process.env.UNIFI_API_KEY;
@@ -13,6 +13,33 @@ const UNIFI_REQUEST_TIMEOUT_MS = Number.isFinite(Number(process.env.UNIFI_REQUES
 const AUTHORIZE_DEADLINE_MS = Number.isFinite(Number(process.env.AUTHORIZE_DEADLINE_MS)) ? Math.max(1, Math.floor(Number(process.env.AUTHORIZE_DEADLINE_MS))) : 15000;
 const CLIENT_WAIT_ATTEMPTS = Number.isFinite(Number(process.env.CLIENT_WAIT_ATTEMPTS)) ? Math.max(1, Math.floor(Number(process.env.CLIENT_WAIT_ATTEMPTS))) : 12;
 const CLIENT_WAIT_INTERVAL_MS = Number.isFinite(Number(process.env.CLIENT_WAIT_INTERVAL_MS)) ? Math.max(100, Math.floor(Number(process.env.CLIENT_WAIT_INTERVAL_MS))) : 750;
+
+const parseRequiredPositiveInteger = (name, fallback) => {
+  const raw = process.env[name];
+  const value = raw === undefined || raw === "" ? String(fallback) : raw;
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return Number(value);
+};
+
+const parseOptionalPositiveInteger = (name) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  if (!/^[1-9][0-9]*$/.test(raw)) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return Number(raw);
+};
+
+const AUTH_TIME_LIMIT_MINUTES = parseRequiredPositiveInteger("AUTH_TIME_LIMIT_MINUTES", 240);
+const AUTH_DATA_USAGE_LIMIT_MBYTES = parseOptionalPositiveInteger("AUTH_DATA_USAGE_LIMIT_MBYTES");
+const AUTH_RX_RATE_LIMIT_KBPS = parseOptionalPositiveInteger("AUTH_RX_RATE_LIMIT_KBPS");
+const AUTH_TX_RATE_LIMIT_KBPS = parseOptionalPositiveInteger("AUTH_TX_RATE_LIMIT_KBPS");
+const AUTH_RATE_LIMIT_WINDOW_MS = parseRequiredPositiveInteger("AUTH_RATE_LIMIT_WINDOW_MS", 60000);
+const AUTH_RATE_LIMIT_MAX_PER_MAC = parseRequiredPositiveInteger("AUTH_RATE_LIMIT_MAX_PER_MAC", 10);
+const AUTH_RATE_LIMIT_MAX_GLOBAL = parseRequiredPositiveInteger("AUTH_RATE_LIMIT_MAX_GLOBAL", 600);
+const AUTH_RATE_LIMIT_MAX_MAC_KEYS = parseRequiredPositiveInteger("AUTH_RATE_LIMIT_MAX_MAC_KEYS", 5000);
 
 if (!UNIFI_BASE) {
   throw new Error("Missing UNIFI_BASE");
@@ -101,6 +128,76 @@ const publicCodeFor = (error) => {
   if (error instanceof AppError && error.code) return error.code;
   if (error && error.code === "UPSTREAM_TIMEOUT") return "UPSTREAM_TIMEOUT";
   return "INTERNAL_ERROR";
+};
+
+const isObjectResponse = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+const validateSiteInput = (value) => {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") throw new AppError("INVALID_SITE", 400);
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.length > 128 || !/^[A-Za-z0-9._~-]+$/.test(trimmed)) {
+    throw new AppError("INVALID_SITE", 400);
+  }
+  return trimmed;
+};
+
+const authPolicyPayload = () => {
+  const payload = { timeLimitMinutes: AUTH_TIME_LIMIT_MINUTES };
+  if (AUTH_DATA_USAGE_LIMIT_MBYTES !== undefined) payload.dataUsageLimitMBytes = AUTH_DATA_USAGE_LIMIT_MBYTES;
+  if (AUTH_RX_RATE_LIMIT_KBPS !== undefined) payload.rxRateLimitKbps = AUTH_RX_RATE_LIMIT_KBPS;
+  if (AUTH_TX_RATE_LIMIT_KBPS !== undefined) payload.txRateLimitKbps = AUTH_TX_RATE_LIMIT_KBPS;
+  return payload;
+};
+
+const macWindowCounts = new Map();
+let globalWindow = { startedAt: nowMs(), count: 0 };
+
+const retryAfterSeconds = (windowStartedAt) => Math.max(1, Math.ceil((windowStartedAt + AUTH_RATE_LIMIT_WINDOW_MS - nowMs()) / 1000));
+
+const pruneMacWindows = (now) => {
+  for (const [mac, state] of macWindowCounts.entries()) {
+    if (now - state.startedAt >= AUTH_RATE_LIMIT_WINDOW_MS) {
+      macWindowCounts.delete(mac);
+    }
+  }
+};
+
+const checkAuthorizeRateLimit = (mac) => {
+  const now = nowMs();
+  if (now - globalWindow.startedAt >= AUTH_RATE_LIMIT_WINDOW_MS) {
+    globalWindow = { startedAt: now, count: 0 };
+  }
+  globalWindow.count += 1;
+  if (globalWindow.count > AUTH_RATE_LIMIT_MAX_GLOBAL) {
+    return { limited: true, scope: "global", retryAfterSeconds: retryAfterSeconds(globalWindow.startedAt) };
+  }
+
+  if (!/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac)) return { limited: false };
+
+  let macState = macWindowCounts.get(mac);
+  if (macState && now - macState.startedAt >= AUTH_RATE_LIMIT_WINDOW_MS) {
+    macWindowCounts.delete(mac);
+    macState = null;
+  }
+  if (!macState) {
+    if (macWindowCounts.size >= AUTH_RATE_LIMIT_MAX_MAC_KEYS) {
+      pruneMacWindows(now);
+    }
+    if (macWindowCounts.size >= AUTH_RATE_LIMIT_MAX_MAC_KEYS) {
+      return { limited: true, scope: "mac_keys", retryAfterSeconds: 1 };
+    }
+    macState = { startedAt: now, count: 0 };
+    macWindowCounts.set(mac, macState);
+  }
+
+  macState.count += 1;
+  if (macState.count > AUTH_RATE_LIMIT_MAX_PER_MAC) {
+    return { limited: true, scope: "mac", retryAfterSeconds: retryAfterSeconds(macState.startedAt) };
+  }
+
+  return { limited: false };
 };
 
 async function unifiRequest(path, { method = "GET", body = null, headers = {}, requestId, route, deadline } = {}) {
@@ -211,7 +308,10 @@ async function unifiRequest(path, { method = "GET", body = null, headers = {}, r
 
 async function getSites(context = {}) {
   const j = await unifiRequest("/proxy/network/integration/v1/sites", context);
-  return j && j.data ? j.data : [];
+  if (!isObjectResponse(j) || !Array.isArray(j.data)) {
+    throw new AppError("UPSTREAM_ERROR", 502);
+  }
+  return j.data;
 }
 
 async function resolveSiteId(siteRef, context = {}) {
@@ -234,8 +334,10 @@ async function resolveSiteId(siteRef, context = {}) {
 async function findClientByMac(siteId, mac, context = {}) {
   const m = normMac(mac);
   const j = await unifiRequest(`/proxy/network/integration/v1/sites/${siteId}/clients?filter=macAddress.eq('${m}')`, context);
-  const list = j && j.data ? j.data : [];
-  return list.length ? list[0] : null;
+  if (!isObjectResponse(j) || !Array.isArray(j.data)) {
+    throw new AppError("UPSTREAM_ERROR", 502);
+  }
+  return j.data.length ? j.data[0] : null;
 }
 
 async function waitForClientId(siteId, mac, { attempts = CLIENT_WAIT_ATTEMPTS, intervalMs = CLIENT_WAIT_INTERVAL_MS, deadline, requestId, route } = {}) {
@@ -249,12 +351,7 @@ async function waitForClientId(siteId, mac, { attempts = CLIENT_WAIT_ATTEMPTS, i
 }
 
 async function authorizeClient(siteId, clientId, opts, context = {}) {
-  const payload = { action: "AUTHORIZE_GUEST_ACCESS" };
-
-  if (opts && Number.isFinite(opts.timeLimitMinutes)) payload.timeLimitMinutes = opts.timeLimitMinutes;
-  if (opts && Number.isFinite(opts.dataUsageLimitMBytes)) payload.dataUsageLimitMBytes = opts.dataUsageLimitMBytes;
-  if (opts && Number.isFinite(opts.rxRateLimitKbps)) payload.rxRateLimitKbps = opts.rxRateLimitKbps;
-  if (opts && Number.isFinite(opts.txRateLimitKbps)) payload.txRateLimitKbps = opts.txRateLimitKbps;
+  const payload = { action: "AUTHORIZE_GUEST_ACCESS", ...opts };
 
   return await unifiRequest(`/proxy/network/integration/v1/sites/${siteId}/clients/${clientId}/actions`, {
     ...context,
@@ -296,7 +393,7 @@ const readinessHandler = async (req, res) => {
   const startedAt = nowMs();
   const route = req.path;
   try {
-    const sites = await getSites({ requestId, route });
+    await getSites({ requestId, route });
     logJson("info", "health.ready.success", {
       requestId,
       route,
@@ -304,7 +401,7 @@ const readinessHandler = async (req, res) => {
       durationMs: nowMs() - startedAt,
       status: 200
     });
-    res.json({ ok: true, sites: sites.map((x) => ({ id: x.id, internalReference: x.internalReference, name: x.name })) });
+    res.json({ ok: true });
   } catch (e) {
     const status = publicStatusFor(e);
     const errorCode = publicCodeFor(e) === "AUTHORIZE_TIMEOUT" ? "UPSTREAM_TIMEOUT" : publicCodeFor(e);
@@ -335,18 +432,35 @@ app.post("/api/authorize", async (req, res) => {
   const deadline = createDeadline(AUTHORIZE_DEADLINE_MS);
   const route = req.path;
   const mac = normMac(req.body && req.body.mac);
-  const siteRef = req.body && req.body.site;
+  let siteRef = "";
 
   logJson("info", "authorize.start", {
     requestId,
     route,
     method: req.method,
-    siteRef,
     maskedMac: maskMac(mac)
   });
 
+  const rateLimit = checkAuthorizeRateLimit(mac);
+  if (rateLimit.limited) {
+    const validMac = /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac);
+    res.set("Retry-After", String(rateLimit.retryAfterSeconds));
+    logJson("info", "authorize.rate_limited", {
+      requestId,
+      route,
+      method: req.method,
+      maskedMac: validMac ? maskMac(mac) : undefined,
+      durationMs: nowMs() - startedAt,
+      status: 429,
+      errorCode: "RATE_LIMITED",
+      rateLimitScope: rateLimit.scope,
+      retryAfterSeconds: rateLimit.retryAfterSeconds
+    });
+    return res.status(429).json({ ok: false, error: "RATE_LIMITED" });
+  }
+
   try {
-    const minutesRaw = req.body && req.body.minutes;
+    siteRef = validateSiteInput(req.body && req.body.site);
 
     if (!mac || !/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac)) {
       logJson("info", "authorize.error", {
@@ -360,8 +474,6 @@ app.post("/api/authorize", async (req, res) => {
       });
       return res.status(400).json({ ok: false, error: "INVALID_MAC" });
     }
-
-    const minutes = Number.isFinite(Number(minutesRaw)) ? Math.max(1, Math.floor(Number(minutesRaw))) : 720;
 
     let siteId = null;
     let clientId = null;
@@ -392,12 +504,7 @@ app.post("/api/authorize", async (req, res) => {
       return res.status(404).json({ ok: false, error: "CLIENT_NOT_FOUND" });
     }
 
-    const granted = await authorizeClient(siteId, clientId, {
-      timeLimitMinutes: minutes,
-      dataUsageLimitMBytes: req.body && Number.isFinite(Number(req.body.dataUsageLimitMBytes)) ? Number(req.body.dataUsageLimitMBytes) : undefined,
-      rxRateLimitKbps: req.body && Number.isFinite(Number(req.body.rxRateLimitKbps)) ? Number(req.body.rxRateLimitKbps) : undefined,
-      txRateLimitKbps: req.body && Number.isFinite(Number(req.body.txRateLimitKbps)) ? Number(req.body.txRateLimitKbps) : undefined
-    }, { requestId, route, deadline });
+    await authorizeClient(siteId, clientId, authPolicyPayload(), { requestId, route, deadline });
 
     if (POST_AUTH_DELAY_MS > 0) await sleepWithDeadline(POST_AUTH_DELAY_MS, deadline);
 
@@ -411,7 +518,7 @@ app.post("/api/authorize", async (req, res) => {
       durationMs: nowMs() - startedAt,
       status: 200
     });
-    res.json({ ok: true, siteId, clientId, result: granted, postAuthDelayMs: POST_AUTH_DELAY_MS });
+    res.json({ ok: true });
   } catch (e) {
     const expired = deadline.expired() || publicCodeFor(e) === "AUTHORIZE_TIMEOUT";
     const status = expired ? 504 : publicStatusFor(e);
@@ -428,6 +535,17 @@ app.post("/api/authorize", async (req, res) => {
     });
     res.status(status).json({ ok: false, error: errorCode });
   }
+});
+
+app.use((err, _req, res, next) => {
+  if (!err) return next();
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({ ok: false, error: "PAYLOAD_TOO_LARGE" });
+  }
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    return res.status(400).json({ ok: false, error: "INVALID_JSON" });
+  }
+  return next(err);
 });
 
 app.listen(3000, "0.0.0.0");

@@ -303,7 +303,6 @@
             const siteRef = getSiteRefFromPath();
 
             const finalUrl = "http://diag.vn/panel/tam-soat-ung-thu-toan-dien/?utm_source=offline&utm_medium=wifi-banner&utm_campaign=wellness-elite_0326";
-            const minutes = 1440;
 
             if (!mac) {
                 if (dbg) dbg.textContent = "Missing UniFi parameter";
@@ -319,7 +318,7 @@
                 setBar(25);
 
                 await authorizeWithRetry(
-                    { mac: mac, minutes: minutes, site: siteRef },
+                    { mac: mac, site: siteRef },
                     0,
                     900
                 );
