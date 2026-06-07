@@ -8,6 +8,8 @@ const UNIFI_BASE = process.env.UNIFI_BASE;
 const UNIFI_API_KEY = process.env.UNIFI_API_KEY;
 const UNIFI_SITE = process.env.UNIFI_SITE || "default";
 const POST_AUTH_DELAY_MS = Number.isFinite(Number(process.env.POST_AUTH_DELAY_MS)) ? Math.max(0, Number(process.env.POST_AUTH_DELAY_MS)) : 1500;
+const CLIENT_WAIT_ATTEMPTS = Number.isFinite(Number(process.env.CLIENT_WAIT_ATTEMPTS)) ? Math.max(1, Math.floor(Number(process.env.CLIENT_WAIT_ATTEMPTS))) : 45;
+const CLIENT_WAIT_INTERVAL_MS = Number.isFinite(Number(process.env.CLIENT_WAIT_INTERVAL_MS)) ? Math.max(100, Math.floor(Number(process.env.CLIENT_WAIT_INTERVAL_MS))) : 1000;
 
 if (!UNIFI_BASE) {
   throw new Error("Missing UNIFI_BASE");
@@ -93,7 +95,7 @@ async function findClientByMac(siteId, mac) {
   return list.length ? list[0] : null;
 }
 
-async function waitForClientId(siteId, mac, { attempts = 24, intervalMs = 250 } = {}) {
+async function waitForClientId(siteId, mac, { attempts = CLIENT_WAIT_ATTEMPTS, intervalMs = CLIENT_WAIT_INTERVAL_MS } = {}) {
   for (let i = 0; i < attempts; i += 1) {
     const c = await findClientByMac(siteId, mac);
     if (c && c.id) return c.id;
