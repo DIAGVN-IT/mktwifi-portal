@@ -262,31 +262,35 @@
             fireImage("http://neverssl.com/");
         }
 
-        async function authorizeWithRetry(payload, maxRetry = 2, delayMs = 900) {
+        async function authorizeWithRetry(payload, maxRetry = 2, delayMs = 1200) {
             let lastError = null;
 
             for (let i = 0; i <= maxRetry; i++) {
+                let r;
                 try {
-                    const r = await fetch("/api/authorize", {
+                    r = await fetch("/api/authorize", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify(payload)
                     });
-
-                    const j = await r.json().catch(() => null);
-
-                    if (r.ok && j && j.ok === true) {
-                        return j;
-                    }
-
-                    lastError = j && (j.error || j.message) ? (j.error || j.message) : ("HTTP " + r.status);
                 } catch (e) {
                     lastError = e && e.message ? e.message : "network_error";
+                    throw new Error(lastError || "AUTHORIZE_FAILED");
                 }
 
-                if (i < maxRetry) {
-                    await sleep(delayMs);
+                const j = await r.json().catch(() => null);
+
+                if (r.ok && j && j.ok === true) {
+                    return j;
                 }
+
+                lastError = j && (j.error || j.message) ? (j.error || j.message) : ("HTTP " + r.status);
+                if (lastError === "CLIENT_NOT_FOUND" && i < maxRetry) {
+                    await sleep(delayMs);
+                    continue;
+                }
+
+                throw new Error(lastError || "AUTHORIZE_FAILED");
             }
 
             throw new Error(lastError || "AUTHORIZE_FAILED");
@@ -319,8 +323,8 @@
 
                 await authorizeWithRetry(
                     { mac: mac, site: siteRef },
-                    0,
-                    900
+                    2,
+                    1200
                 );
 
                 setBar(75);
