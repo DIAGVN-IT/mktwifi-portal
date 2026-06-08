@@ -5,15 +5,6 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json({ limit: "4kb" }));
 
-const UNIFI_BASE = process.env.UNIFI_BASE;
-const UNIFI_API_KEY = process.env.UNIFI_API_KEY;
-const UNIFI_SITE = process.env.UNIFI_SITE || "default";
-const POST_AUTH_DELAY_MS = Number.isFinite(Number(process.env.POST_AUTH_DELAY_MS)) ? Math.max(0, Number(process.env.POST_AUTH_DELAY_MS)) : 1500;
-const UNIFI_REQUEST_TIMEOUT_MS = Number.isFinite(Number(process.env.UNIFI_REQUEST_TIMEOUT_MS)) ? Math.max(1, Math.floor(Number(process.env.UNIFI_REQUEST_TIMEOUT_MS))) : 5000;
-const AUTHORIZE_DEADLINE_MS = Number.isFinite(Number(process.env.AUTHORIZE_DEADLINE_MS)) ? Math.max(1, Math.floor(Number(process.env.AUTHORIZE_DEADLINE_MS))) : 30000;
-const CLIENT_WAIT_ATTEMPTS = Number.isFinite(Number(process.env.CLIENT_WAIT_ATTEMPTS)) ? Math.max(1, Math.floor(Number(process.env.CLIENT_WAIT_ATTEMPTS))) : 24;
-const CLIENT_WAIT_INTERVAL_MS = Number.isFinite(Number(process.env.CLIENT_WAIT_INTERVAL_MS)) ? Math.max(100, Math.floor(Number(process.env.CLIENT_WAIT_INTERVAL_MS))) : 1000;
-
 const parseRequiredPositiveInteger = (name, fallback) => {
   const raw = process.env[name];
   const value = raw === undefined || raw === "" ? String(fallback) : raw;
@@ -39,6 +30,18 @@ const parseOptionalPositiveInteger = (name) => {
   }
   return parsed;
 };
+
+const UNIFI_BASE = process.env.UNIFI_BASE;
+const UNIFI_API_KEY = process.env.UNIFI_API_KEY;
+const UNIFI_SITE = process.env.UNIFI_SITE || "default";
+const POST_AUTH_DELAY_MS = Number.isFinite(Number(process.env.POST_AUTH_DELAY_MS)) ? Math.max(0, Number(process.env.POST_AUTH_DELAY_MS)) : 1500;
+const UNIFI_REQUEST_TIMEOUT_MS = Number.isFinite(Number(process.env.UNIFI_REQUEST_TIMEOUT_MS)) ? Math.max(1, Math.floor(Number(process.env.UNIFI_REQUEST_TIMEOUT_MS))) : 5000;
+const AUTHORIZE_DEADLINE_MS = Number.isFinite(Number(process.env.AUTHORIZE_DEADLINE_MS)) ? Math.max(1, Math.floor(Number(process.env.AUTHORIZE_DEADLINE_MS))) : 30000;
+const CLIENT_WAIT_ATTEMPTS = Number.isFinite(Number(process.env.CLIENT_WAIT_ATTEMPTS)) ? Math.max(1, Math.floor(Number(process.env.CLIENT_WAIT_ATTEMPTS))) : 42;
+const CLIENT_WAIT_INTERVAL_MS = Number.isFinite(Number(process.env.CLIENT_WAIT_INTERVAL_MS)) ? Math.max(100, Math.floor(Number(process.env.CLIENT_WAIT_INTERVAL_MS))) : 1000;
+const CLIENT_FAST_WAIT_ATTEMPTS = parseRequiredPositiveInteger("CLIENT_FAST_WAIT_ATTEMPTS", 24);
+const CLIENT_FAST_WAIT_INTERVAL_MS = parseRequiredPositiveInteger("CLIENT_FAST_WAIT_INTERVAL_MS", 250);
+const SITE_CACHE_TTL_MS = parseRequiredPositiveInteger("SITE_CACHE_TTL_MS", 300000);
 
 const AUTH_TIME_LIMIT_MINUTES = parseRequiredPositiveInteger("AUTH_TIME_LIMIT_MINUTES", 240);
 const AUTH_DATA_USAGE_LIMIT_MBYTES = parseOptionalPositiveInteger("AUTH_DATA_USAGE_LIMIT_MBYTES");
@@ -331,21 +334,53 @@ async function getSites(context = {}) {
   return j.data;
 }
 
+const siteResolutionCache = new Map();
+
+const cacheSiteRef = (ref, siteId, expiresAt) => {
+  if (typeof ref === "string" && ref && typeof siteId === "string" && siteId && !siteResolutionCache.has(ref)) {
+    siteResolutionCache.set(ref, { siteId, expiresAt });
+  }
+};
+
+const refreshSiteResolutionCache = (sites, expiresAt) => {
+  siteResolutionCache.clear();
+  for (const s of sites) {
+    if (!s || typeof s.id !== "string" || !s.id) continue;
+    cacheSiteRef(s.id, s.id, expiresAt);
+    cacheSiteRef(s.internalReference, s.id, expiresAt);
+    cacheSiteRef(s.name, s.id, expiresAt);
+  }
+};
+
 async function resolveSiteId(siteRef, context = {}) {
   const ref = siteRef || UNIFI_SITE;
-  if (isUuid(ref)) return ref;
+  if (isUuid(ref)) return { siteId: ref, cacheHit: false, source: "uuid" };
+
+  const cached = siteResolutionCache.get(ref);
+  if (cached) {
+    if (cached.expiresAt > nowMs()) {
+      return { siteId: cached.siteId, cacheHit: true, source: "cache" };
+    }
+    siteResolutionCache.delete(ref);
+  }
 
   const sites = await getSites(context);
+  const expiresAt = nowMs() + SITE_CACHE_TTL_MS;
+  refreshSiteResolutionCache(sites, expiresAt);
   const hit = sites.find(
     (s) =>
-      (typeof s.internalReference === "string" && s.internalReference === ref) ||
-      (typeof s.name === "string" && s.name === ref)
+      s &&
+      typeof s.id === "string" &&
+      s.id &&
+      (s.id === ref ||
+        (typeof s.internalReference === "string" && s.internalReference === ref) ||
+        (typeof s.name === "string" && s.name === ref))
   );
 
   if (!hit || !hit.id) {
     throw new AppError("SITE_NOT_FOUND", 404);
   }
-  return hit.id;
+  return { siteId: hit.id, cacheHit: false, source: "upstream" };
 }
 
 async function findClientByMac(siteId, mac, context = {}) {
@@ -357,14 +392,43 @@ async function findClientByMac(siteId, mac, context = {}) {
   return j.data.length ? j.data[0] : null;
 }
 
-async function waitForClientId(siteId, mac, { attempts = CLIENT_WAIT_ATTEMPTS, intervalMs = CLIENT_WAIT_INTERVAL_MS, deadline, requestId, route } = {}) {
-  for (let i = 0; i < attempts; i += 1) {
-    assertDeadline(deadline);
-    const c = await findClientByMac(siteId, mac, { requestId, route, deadline });
-    if (c && c.id) return c.id;
-    if (i < attempts - 1) await sleepWithDeadline(intervalMs, deadline);
+const intervalAfterClientLookupMiss = (attemptNumber) =>
+  attemptNumber <= CLIENT_FAST_WAIT_ATTEMPTS ? CLIENT_FAST_WAIT_INTERVAL_MS : CLIENT_WAIT_INTERVAL_MS;
+
+const clientLookupMetrics = (startedAt, attempts, fastAttempts, slowAttempts) => ({
+  attempts,
+  fastAttempts,
+  slowAttempts,
+  durationMs: nowMs() - startedAt
+});
+
+const attachClientLookupMetrics = (error, metrics) => {
+  if (error && typeof error === "object") {
+    error.clientLookupMetrics = metrics;
   }
-  return null;
+  throw error;
+};
+
+async function waitForClientId(siteId, mac, { attempts = CLIENT_WAIT_ATTEMPTS, deadline, requestId, route } = {}) {
+  const startedAt = nowMs();
+  let lookupAttempts = 0;
+  let fastAttempts = 0;
+  let slowAttempts = 0;
+  try {
+    for (let i = 0; i < attempts; i += 1) {
+      assertDeadline(deadline);
+      const attemptNumber = i + 1;
+      lookupAttempts += 1;
+      if (attemptNumber <= CLIENT_FAST_WAIT_ATTEMPTS) fastAttempts += 1;
+      else slowAttempts += 1;
+      const c = await findClientByMac(siteId, mac, { requestId, route, deadline });
+      if (c && c.id) return { clientId: c.id, ...clientLookupMetrics(startedAt, lookupAttempts, fastAttempts, slowAttempts) };
+      if (i < attempts - 1) await sleepWithDeadline(intervalAfterClientLookupMiss(attemptNumber), deadline);
+    }
+    return { clientId: null, ...clientLookupMetrics(startedAt, lookupAttempts, fastAttempts, slowAttempts) };
+  } catch (e) {
+    attachClientLookupMetrics(e, clientLookupMetrics(startedAt, lookupAttempts, fastAttempts, slowAttempts));
+  }
 }
 
 async function authorizeClient(siteId, clientId, opts, context = {}) {
@@ -378,30 +442,44 @@ async function authorizeClient(siteId, clientId, opts, context = {}) {
 }
 
 async function findClientAcrossSites(mac, { deadline, requestId, route } = {}) {
-  const sites = await getSites({ requestId, route, deadline });
-  for (let attempt = 0; attempt < CLIENT_WAIT_ATTEMPTS; attempt += 1) {
-    assertDeadline(deadline);
-    for (const s of sites) {
+  const startedAt = nowMs();
+  let lookupAttempts = 0;
+  let fastAttempts = 0;
+  let slowAttempts = 0;
+  try {
+    const sites = await getSites({ requestId, route, deadline });
+    for (let attempt = 0; attempt < CLIENT_WAIT_ATTEMPTS; attempt += 1) {
       assertDeadline(deadline);
-      if (!s || !s.id) continue;
-      try {
-        const c = await findClientByMac(s.id, mac, { requestId, route, deadline });
-        if (c && c.id) return { siteId: s.id, clientId: c.id };
-      } catch (e) {
-        logJson("error", "fallback.site_lookup_error", {
-          requestId,
-          route,
-          siteId: s.id,
-          maskedMac: maskMac(mac),
-          errorCode: publicCodeFor(e),
-          status: publicStatusFor(e)
-        });
+      const attemptNumber = attempt + 1;
+      for (const s of sites) {
         assertDeadline(deadline);
+        if (!s || !s.id) continue;
+        lookupAttempts += 1;
+        if (attemptNumber <= CLIENT_FAST_WAIT_ATTEMPTS) fastAttempts += 1;
+        else slowAttempts += 1;
+        try {
+          const c = await findClientByMac(s.id, mac, { requestId, route, deadline });
+          if (c && c.id) {
+            return { siteId: s.id, clientId: c.id, ...clientLookupMetrics(startedAt, lookupAttempts, fastAttempts, slowAttempts) };
+          }
+        } catch (e) {
+          logJson("error", "fallback.site_lookup_error", {
+            requestId,
+            route,
+            siteId: s.id,
+            maskedMac: maskMac(mac),
+            errorCode: publicCodeFor(e),
+            status: publicStatusFor(e)
+          });
+          assertDeadline(deadline);
+        }
       }
+      if (attempt < CLIENT_WAIT_ATTEMPTS - 1) await sleepWithDeadline(intervalAfterClientLookupMiss(attemptNumber), deadline);
     }
-    if (attempt < CLIENT_WAIT_ATTEMPTS - 1) await sleepWithDeadline(CLIENT_WAIT_INTERVAL_MS, deadline);
+    return { siteId: null, clientId: null, ...clientLookupMetrics(startedAt, lookupAttempts, fastAttempts, slowAttempts) };
+  } catch (e) {
+    attachClientLookupMetrics(e, clientLookupMetrics(startedAt, lookupAttempts, fastAttempts, slowAttempts));
   }
-  return null;
 }
 
 const readinessHandler = async (req, res) => {
@@ -450,6 +528,16 @@ app.post("/api/authorize", async (req, res) => {
   const route = req.path;
   const mac = normMac(req.body && req.body.mac);
   let siteRef = "";
+  let siteId = null;
+  let clientId = null;
+  let siteCacheHit = null;
+  let siteResolveSource = null;
+  let siteResolveDurationMs = null;
+  let clientLookupAttempts = null;
+  let clientLookupFastAttempts = null;
+  let clientLookupSlowAttempts = null;
+  let clientLookupDurationMs = null;
+  let authorizeActionDurationMs = null;
 
   logJson("info", "authorize.start", {
     requestId,
@@ -492,18 +580,31 @@ app.post("/api/authorize", async (req, res) => {
       return res.status(400).json({ ok: false, error: "INVALID_MAC" });
     }
 
-    let siteId = null;
-    let clientId = null;
-
     if (siteRef) {
-      siteId = await resolveSiteId(siteRef, { requestId, route, deadline });
-      clientId = await waitForClientId(siteId, mac, { deadline, requestId, route });
-    } else {
-      const r = await findClientAcrossSites(mac, { deadline, requestId, route });
-      if (r) {
-        siteId = r.siteId;
-        clientId = r.clientId;
+      const siteResolveStartedAt = nowMs();
+      let siteResolution;
+      try {
+        siteResolution = await resolveSiteId(siteRef, { requestId, route, deadline });
+      } finally {
+        siteResolveDurationMs = nowMs() - siteResolveStartedAt;
       }
+      siteId = siteResolution.siteId;
+      siteCacheHit = siteResolution.cacheHit;
+      siteResolveSource = siteResolution.source;
+      const lookup = await waitForClientId(siteId, mac, { deadline, requestId, route });
+      clientId = lookup.clientId;
+      clientLookupAttempts = lookup.attempts;
+      clientLookupFastAttempts = lookup.fastAttempts;
+      clientLookupSlowAttempts = lookup.slowAttempts;
+      clientLookupDurationMs = lookup.durationMs;
+    } else {
+      const lookup = await findClientAcrossSites(mac, { deadline, requestId, route });
+      siteId = lookup.siteId;
+      clientId = lookup.clientId;
+      clientLookupAttempts = lookup.attempts;
+      clientLookupFastAttempts = lookup.fastAttempts;
+      clientLookupSlowAttempts = lookup.slowAttempts;
+      clientLookupDurationMs = lookup.durationMs;
     }
 
     if (!siteId || !clientId) {
@@ -516,12 +617,24 @@ app.post("/api/authorize", async (req, res) => {
         maskedMac: maskMac(mac),
         durationMs: nowMs() - startedAt,
         status: 404,
-        errorCode: "CLIENT_NOT_FOUND"
+        errorCode: "CLIENT_NOT_FOUND",
+        siteCacheHit,
+        siteResolveSource,
+        siteResolveDurationMs,
+        clientLookupAttempts,
+        clientLookupFastAttempts,
+        clientLookupSlowAttempts,
+        clientLookupDurationMs
       });
       return res.status(404).json({ ok: false, error: "CLIENT_NOT_FOUND" });
     }
 
-    await authorizeClient(siteId, clientId, authPolicyPayload(), { requestId, route, deadline });
+    const authorizeActionStartedAt = nowMs();
+    try {
+      await authorizeClient(siteId, clientId, authPolicyPayload(), { requestId, route, deadline });
+    } finally {
+      authorizeActionDurationMs = nowMs() - authorizeActionStartedAt;
+    }
 
     if (POST_AUTH_DELAY_MS > 0) await sleepWithDeadline(POST_AUTH_DELAY_MS, deadline);
 
@@ -533,10 +646,24 @@ app.post("/api/authorize", async (req, res) => {
       siteId,
       maskedMac: maskMac(mac),
       durationMs: nowMs() - startedAt,
-      status: 200
+      status: 200,
+      siteCacheHit,
+      siteResolveSource,
+      siteResolveDurationMs,
+      clientLookupAttempts,
+      clientLookupFastAttempts,
+      clientLookupSlowAttempts,
+      clientLookupDurationMs,
+      authorizeActionDurationMs
     });
     res.json({ ok: true });
   } catch (e) {
+    if (e && typeof e === "object" && e.clientLookupMetrics) {
+      clientLookupAttempts = clientLookupAttempts ?? e.clientLookupMetrics.attempts;
+      clientLookupFastAttempts = clientLookupFastAttempts ?? e.clientLookupMetrics.fastAttempts;
+      clientLookupSlowAttempts = clientLookupSlowAttempts ?? e.clientLookupMetrics.slowAttempts;
+      clientLookupDurationMs = clientLookupDurationMs ?? e.clientLookupMetrics.durationMs;
+    }
     const expired = deadline.expired() || publicCodeFor(e) === "AUTHORIZE_TIMEOUT";
     const status = expired ? 504 : publicStatusFor(e);
     const errorCode = expired ? "AUTHORIZE_TIMEOUT" : publicCodeFor(e);
@@ -548,7 +675,15 @@ app.post("/api/authorize", async (req, res) => {
       maskedMac: maskMac(mac),
       durationMs: nowMs() - startedAt,
       status,
-      errorCode
+      errorCode,
+      siteCacheHit,
+      siteResolveSource,
+      siteResolveDurationMs,
+      clientLookupAttempts,
+      clientLookupFastAttempts,
+      clientLookupSlowAttempts,
+      clientLookupDurationMs,
+      authorizeActionDurationMs
     });
     res.status(status).json({ ok: false, error: errorCode });
   }
