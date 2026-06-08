@@ -10,9 +10,9 @@ const UNIFI_API_KEY = process.env.UNIFI_API_KEY;
 const UNIFI_SITE = process.env.UNIFI_SITE || "default";
 const POST_AUTH_DELAY_MS = Number.isFinite(Number(process.env.POST_AUTH_DELAY_MS)) ? Math.max(0, Number(process.env.POST_AUTH_DELAY_MS)) : 1500;
 const UNIFI_REQUEST_TIMEOUT_MS = Number.isFinite(Number(process.env.UNIFI_REQUEST_TIMEOUT_MS)) ? Math.max(1, Math.floor(Number(process.env.UNIFI_REQUEST_TIMEOUT_MS))) : 5000;
-const AUTHORIZE_DEADLINE_MS = Number.isFinite(Number(process.env.AUTHORIZE_DEADLINE_MS)) ? Math.max(1, Math.floor(Number(process.env.AUTHORIZE_DEADLINE_MS))) : 15000;
-const CLIENT_WAIT_ATTEMPTS = Number.isFinite(Number(process.env.CLIENT_WAIT_ATTEMPTS)) ? Math.max(1, Math.floor(Number(process.env.CLIENT_WAIT_ATTEMPTS))) : 12;
-const CLIENT_WAIT_INTERVAL_MS = Number.isFinite(Number(process.env.CLIENT_WAIT_INTERVAL_MS)) ? Math.max(100, Math.floor(Number(process.env.CLIENT_WAIT_INTERVAL_MS))) : 750;
+const AUTHORIZE_DEADLINE_MS = Number.isFinite(Number(process.env.AUTHORIZE_DEADLINE_MS)) ? Math.max(1, Math.floor(Number(process.env.AUTHORIZE_DEADLINE_MS))) : 30000;
+const CLIENT_WAIT_ATTEMPTS = Number.isFinite(Number(process.env.CLIENT_WAIT_ATTEMPTS)) ? Math.max(1, Math.floor(Number(process.env.CLIENT_WAIT_ATTEMPTS))) : 24;
+const CLIENT_WAIT_INTERVAL_MS = Number.isFinite(Number(process.env.CLIENT_WAIT_INTERVAL_MS)) ? Math.max(100, Math.floor(Number(process.env.CLIENT_WAIT_INTERVAL_MS))) : 1000;
 
 const parseRequiredPositiveInteger = (name, fallback) => {
   const raw = process.env[name];
