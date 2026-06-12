@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import net from "net";
 import express from "express";
 import fetch from "node-fetch";
 
@@ -42,6 +43,15 @@ const CLIENT_WAIT_INTERVAL_MS = Number.isFinite(Number(process.env.CLIENT_WAIT_I
 const CLIENT_FAST_WAIT_ATTEMPTS = parseRequiredPositiveInteger("CLIENT_FAST_WAIT_ATTEMPTS", 24);
 const CLIENT_FAST_WAIT_INTERVAL_MS = parseRequiredPositiveInteger("CLIENT_FAST_WAIT_INTERVAL_MS", 250);
 const SITE_CACHE_TTL_MS = parseRequiredPositiveInteger("SITE_CACHE_TTL_MS", 300000);
+const CLIENT_WARMUP_MAX_MS = parseRequiredPositiveInteger("CLIENT_WARMUP_MAX_MS", 90000);
+const CLIENT_WARMUP_READY_TTL_MS = parseRequiredPositiveInteger("CLIENT_WARMUP_READY_TTL_MS", 120000);
+const CLIENT_WARMUP_FAILED_TTL_MS = parseRequiredPositiveInteger("CLIENT_WARMUP_FAILED_TTL_MS", 5000);
+const CLIENT_WARMUP_MAX_KEYS = parseRequiredPositiveInteger("CLIENT_WARMUP_MAX_KEYS", 5000);
+const CLIENT_WARMUP_MAX_ACTIVE = parseRequiredPositiveInteger("CLIENT_WARMUP_MAX_ACTIVE", 30);
+const CLIENT_WARMUP_RATE_LIMIT_WINDOW_MS = parseRequiredPositiveInteger("CLIENT_WARMUP_RATE_LIMIT_WINDOW_MS", 60000);
+const CLIENT_WARMUP_RATE_LIMIT_MAX_PER_IP = parseRequiredPositiveInteger("CLIENT_WARMUP_RATE_LIMIT_MAX_PER_IP", 30);
+const CLIENT_WARMUP_RATE_LIMIT_MAX_GLOBAL = parseRequiredPositiveInteger("CLIENT_WARMUP_RATE_LIMIT_MAX_GLOBAL", 600);
+const CLIENT_WARMUP_RATE_LIMIT_MAX_IP_KEYS = parseRequiredPositiveInteger("CLIENT_WARMUP_RATE_LIMIT_MAX_IP_KEYS", 5000);
 
 const AUTH_TIME_LIMIT_MINUTES = parseRequiredPositiveInteger("AUTH_TIME_LIMIT_MINUTES", 240);
 const AUTH_DATA_USAGE_LIMIT_MBYTES = parseOptionalPositiveInteger("AUTH_DATA_USAGE_LIMIT_MBYTES");
@@ -431,6 +441,260 @@ async function waitForClientId(siteId, mac, { attempts = CLIENT_WAIT_ATTEMPTS, d
   }
 }
 
+const strictMacRe = /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/;
+const warmupCache = new Map();
+const warmupIpWindows = new Map();
+let activeWarmupWorkers = 0;
+let warmupGlobalWindow = { startedAt: nowMs(), count: 0 };
+
+const warmupKeyFor = (siteId, mac) => `${siteId}|${mac}`;
+const activeWarmupCount = () => activeWarmupWorkers;
+
+const sanitizeSsid = (value) => {
+  if (typeof value !== "string") return undefined;
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  return cleaned ? cleaned.slice(0, 64) : undefined;
+};
+
+const normalizeOptionalApMac = (value) => {
+  if (value === undefined || value === null || value === "") return undefined;
+  const mac = normMac(value);
+  if (!strictMacRe.test(mac)) throw new AppError("INVALID_AP_MAC", 400);
+  return mac;
+};
+
+const normalizeRedirectTs = (value) => {
+  if (value === undefined || value === null || value === "") return undefined;
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(n) || n <= 0) return undefined;
+  return n;
+};
+
+const redirectAgeMsFor = (redirectTs) => {
+  if (!redirectTs) return undefined;
+  const age = nowMs() - redirectTs * 1000;
+  if (!Number.isFinite(age) || age < 0 || age > 24 * 60 * 60 * 1000) return undefined;
+  return Math.floor(age);
+};
+
+const hashSource = (value) => crypto.createHash("sha256").update(String(value || "unknown")).digest("hex").slice(0, 16);
+
+const normalizeSourceIp = (value) => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 128 || trimmed.includes(",")) return null;
+  if (!net.isIP(trimmed)) return null;
+  return trimmed.toLowerCase();
+};
+
+const warmupSourceFor = (req) => {
+  const sourceKey = normalizeSourceIp(req.get("X-Real-IP")) || normalizeSourceIp(req.socket && req.socket.remoteAddress) || "unknown";
+  return { sourceKey, maskedSource: hashSource(sourceKey) };
+};
+
+const warmupLogFields = (entry, fields = {}) => ({
+  requestId: entry.requestId,
+  route: entry.route,
+  method: entry.method,
+  siteRef: entry.siteRef,
+  siteId: entry.siteId,
+  maskedMac: maskMac(entry.mac),
+  maskedApMac: entry.maskedApMac,
+  ssid: entry.ssid,
+  redirectAgeMs: entry.redirectAgeMs,
+  durationMs: nowMs() - entry.startedAt,
+  lookupAttempts: entry.lookupAttempts,
+  fastAttempts: entry.fastAttempts,
+  slowAttempts: entry.slowAttempts,
+  activeWarmups: activeWarmupCount(),
+  warmupCacheSize: warmupCache.size,
+  ...fields
+});
+
+const deleteWarmupEntryIfCurrent = (siteId, mac, expectedEntry) => {
+  const key = warmupKeyFor(siteId, mac);
+  if (warmupCache.get(key) !== expectedEntry) return false;
+  warmupCache.delete(key);
+  return true;
+};
+
+const pruneWarmupCache = () => {
+  const now = nowMs();
+  for (const entry of warmupCache.values()) {
+    if (entry.expiresAt > now) continue;
+    if (entry.state === "pending") entry.cancelled = true;
+    if (deleteWarmupEntryIfCurrent(entry.siteId, entry.mac, entry)) logJson("info", "client_warmup.expired", warmupLogFields(entry));
+  }
+};
+
+const getWarmupState = (siteId, mac) => {
+  pruneWarmupCache();
+  const entry = warmupCache.get(warmupKeyFor(siteId, mac));
+  if (!entry) return { state: "missing", entry: null };
+  if (entry.state === "ready" && entry.clientId && entry.expiresAt > nowMs()) return { state: "ready", entry };
+  if (entry.state === "pending" && !entry.cancelled && entry.expiresAt > nowMs()) return { state: "pending", entry };
+  if (entry.state === "failed" && entry.expiresAt > nowMs()) return { state: "failed", entry };
+  return { state: "missing", entry: null };
+};
+
+const createWarmupDeadline = (entry) => ({
+  expiresAt: entry.expiresAt,
+  remainingMs: () => Math.max(0, entry.expiresAt - nowMs()),
+  expired: () => nowMs() >= entry.expiresAt
+});
+
+const pruneWarmupIpWindows = (now) => {
+  for (const [sourceKey, state] of warmupIpWindows.entries()) {
+    if (now - state.startedAt >= CLIENT_WARMUP_RATE_LIMIT_WINDOW_MS) warmupIpWindows.delete(sourceKey);
+  }
+};
+
+const warmupRetryAfterSeconds = (windowStartedAt) => Math.max(1, Math.ceil((windowStartedAt + CLIENT_WARMUP_RATE_LIMIT_WINDOW_MS - nowMs()) / 1000));
+
+const retryAfterSecondsForEarliestWarmupIpWindow = (now) => {
+  let earliestExpiresAt = Infinity;
+  for (const state of warmupIpWindows.values()) earliestExpiresAt = Math.min(earliestExpiresAt, state.startedAt + CLIENT_WARMUP_RATE_LIMIT_WINDOW_MS);
+  if (!Number.isFinite(earliestExpiresAt)) return 1;
+  return Math.max(1, Math.ceil((earliestExpiresAt - now) / 1000));
+};
+
+const checkWarmupStartRateLimit = (sourceKey) => {
+  const now = nowMs();
+  if (now - warmupGlobalWindow.startedAt >= CLIENT_WARMUP_RATE_LIMIT_WINDOW_MS) warmupGlobalWindow = { startedAt: now, count: 0 };
+  warmupGlobalWindow.count += 1;
+  if (warmupGlobalWindow.count > CLIENT_WARMUP_RATE_LIMIT_MAX_GLOBAL) return { limited: true, scope: "global", retryAfterSeconds: warmupRetryAfterSeconds(warmupGlobalWindow.startedAt) };
+
+  let ipState = warmupIpWindows.get(sourceKey);
+  if (ipState && now - ipState.startedAt >= CLIENT_WARMUP_RATE_LIMIT_WINDOW_MS) {
+    warmupIpWindows.delete(sourceKey);
+    ipState = null;
+  }
+  if (!ipState) {
+    if (warmupIpWindows.size >= CLIENT_WARMUP_RATE_LIMIT_MAX_IP_KEYS) pruneWarmupIpWindows(now);
+    if (warmupIpWindows.size >= CLIENT_WARMUP_RATE_LIMIT_MAX_IP_KEYS) return { limited: true, scope: "ip_keys", retryAfterSeconds: retryAfterSecondsForEarliestWarmupIpWindow(now) };
+    ipState = { startedAt: now, count: 0 };
+    warmupIpWindows.set(sourceKey, ipState);
+  }
+  ipState.count += 1;
+  if (ipState.count > CLIENT_WARMUP_RATE_LIMIT_MAX_PER_IP) return { limited: true, scope: "ip", retryAfterSeconds: warmupRetryAfterSeconds(ipState.startedAt) };
+  return { limited: false };
+};
+
+const runClientWarmup = async (entry) => {
+  const deadline = createWarmupDeadline(entry);
+  try {
+    while (!entry.cancelled && !deadline.expired() && warmupCache.get(warmupKeyFor(entry.siteId, entry.mac)) === entry) {
+      const attemptNumber = entry.lookupAttempts + 1;
+      entry.lookupAttempts += 1;
+      if (attemptNumber <= CLIENT_FAST_WAIT_ATTEMPTS) entry.fastAttempts += 1;
+      else entry.slowAttempts += 1;
+      const client = await findClientByMac(entry.siteId, entry.mac, { requestId: entry.requestId, route: entry.route, deadline });
+      if (entry.cancelled || warmupCache.get(warmupKeyFor(entry.siteId, entry.mac)) !== entry) {
+        logJson("info", "client_warmup.cancelled", warmupLogFields(entry));
+        return { state: "cancelled" };
+      }
+      if (client && client.id) {
+        entry.state = "ready";
+        entry.clientId = client.id;
+        entry.readyAt = nowMs();
+        entry.expiresAt = entry.readyAt + CLIENT_WARMUP_READY_TTL_MS;
+        logJson("info", "client_warmup.ready", warmupLogFields(entry));
+        return { state: "ready" };
+      }
+      const waitMs = intervalAfterClientLookupMiss(attemptNumber);
+      if (deadline.remainingMs() <= waitMs) break;
+      await sleepWithDeadline(waitMs, deadline);
+    }
+    if (entry.cancelled || warmupCache.get(warmupKeyFor(entry.siteId, entry.mac)) !== entry) {
+      logJson("info", "client_warmup.cancelled", warmupLogFields(entry));
+      return { state: "cancelled" };
+    }
+    entry.cancelled = true;
+    if (deleteWarmupEntryIfCurrent(entry.siteId, entry.mac, entry)) logJson("info", "client_warmup.expired", warmupLogFields(entry));
+    return { state: "expired" };
+  } catch (e) {
+    if (entry.cancelled || warmupCache.get(warmupKeyFor(entry.siteId, entry.mac)) !== entry) {
+      logJson("info", "client_warmup.cancelled", warmupLogFields(entry));
+      return { state: "cancelled" };
+    }
+    if (deadline.expired() || publicCodeFor(e) === "AUTHORIZE_TIMEOUT") {
+      entry.cancelled = true;
+      if (deleteWarmupEntryIfCurrent(entry.siteId, entry.mac, entry)) logJson("info", "client_warmup.expired", warmupLogFields(entry));
+      return { state: "expired" };
+    }
+    entry.state = "failed";
+    entry.failedAt = nowMs();
+    entry.expiresAt = entry.failedAt + CLIENT_WARMUP_FAILED_TTL_MS;
+    entry.clientId = null;
+    logJson("error", "client_warmup.failed", warmupLogFields(entry, { status: publicStatusFor(e), errorCode: publicCodeFor(e) }));
+    return { state: "failed" };
+  } finally {
+    activeWarmupWorkers = Math.max(0, activeWarmupWorkers - 1);
+  }
+};
+
+const startOrReuseWarmup = ({ siteId, mac, requestId, route, method, siteRef, ap, redirectTs, ssid, sourceKey, maskedSource }) => {
+  pruneWarmupCache();
+  const existing = getWarmupState(siteId, mac).entry;
+  if (existing) {
+    logJson("info", "client_warmup.reused", warmupLogFields(existing, { requestId, route, method, maskedSource }));
+    return { ok: true, state: existing.state, entry: existing };
+  }
+  if (activeWarmupCount() >= CLIENT_WARMUP_MAX_ACTIVE || warmupCache.size >= CLIENT_WARMUP_MAX_KEYS) {
+    logJson("info", "client_warmup.busy", { requestId, route, method, siteRef, siteId, maskedMac: maskMac(mac), maskedApMac: ap ? maskMac(ap) : undefined, ssid, redirectAgeMs: redirectAgeMsFor(redirectTs), maskedSource, activeWarmups: activeWarmupCount(), warmupCacheSize: warmupCache.size });
+    return { ok: false, error: "WARMUP_BUSY" };
+  }
+  const rateLimit = checkWarmupStartRateLimit(sourceKey);
+  if (rateLimit.limited) {
+    logJson("info", "client_warmup.rate_limited", { requestId, route, method, siteRef, siteId, maskedMac: maskMac(mac), maskedApMac: ap ? maskMac(ap) : undefined, ssid, redirectAgeMs: redirectAgeMsFor(redirectTs), maskedSource, rateLimitScope: rateLimit.scope, retryAfterSeconds: rateLimit.retryAfterSeconds, activeWarmups: activeWarmupCount(), warmupCacheSize: warmupCache.size });
+    return { ok: false, error: "WARMUP_RATE_LIMITED", retryAfterSeconds: rateLimit.retryAfterSeconds };
+  }
+  const startedAt = nowMs();
+  const entry = {
+    state: "pending",
+    siteId,
+    mac,
+    startedAt,
+    readyAt: null,
+    failedAt: null,
+    expiresAt: startedAt + CLIENT_WARMUP_MAX_MS,
+    clientId: null,
+    lookupAttempts: 0,
+    fastAttempts: 0,
+    slowAttempts: 0,
+    promise: null,
+    cancelled: false,
+    requestId,
+    route,
+    method,
+    siteRef,
+    maskedApMac: ap ? maskMac(ap) : undefined,
+    redirectAgeMs: redirectAgeMsFor(redirectTs),
+    ssid
+  };
+  warmupCache.set(warmupKeyFor(siteId, mac), entry);
+  activeWarmupWorkers += 1;
+  entry.promise = runClientWarmup(entry);
+  logJson("info", "client_warmup.start", warmupLogFields(entry, { maskedSource }));
+  return { ok: true, state: "pending", entry };
+};
+
+const AUTHORIZE_WARMUP_RESERVE_MS = UNIFI_REQUEST_TIMEOUT_MS + POST_AUTH_DELAY_MS + 500;
+
+const warmupAuthorizeJoinBudgetMs = (deadline) => Math.max(0, deadline.remainingMs() - AUTHORIZE_WARMUP_RESERVE_MS);
+
+const awaitWarmupWithinAuthorizeJoinBudget = async (entry, deadline) => {
+  if (!entry || !entry.promise) return { state: entry ? entry.state : "missing" };
+  const joinBudgetMs = warmupAuthorizeJoinBudgetMs(deadline);
+  if (joinBudgetMs <= 0) return { state: "pending", joinBudgetElapsed: true };
+  return await Promise.race([
+    entry.promise,
+    sleep(joinBudgetMs).then(() => ({ state: "pending", joinBudgetElapsed: true }))
+  ]);
+};
+
+const isStaleCachedClientError = (error) => error instanceof AppError && error.code === "UPSTREAM_ERROR" && error.upstreamStatus === 404;
+
 async function authorizeClient(siteId, clientId, opts, context = {}) {
   const payload = { action: "AUTHORIZE_GUEST_ACCESS", ...opts };
 
@@ -520,6 +784,57 @@ app.get("/api/health/ready", readinessHandler);
 
 app.get("/api/health", readinessHandler);
 
+app.post("/api/client-warmup", async (req, res) => {
+  const requestId = requestIdFor(req);
+  res.set("X-Request-ID", requestId);
+  res.set("Cache-Control", "no-store");
+  const startedAt = nowMs();
+  const route = req.path;
+  const method = req.method;
+  let mac = "";
+  let siteRef = "";
+  let siteId = null;
+  try {
+    mac = normMac(req.body && req.body.mac);
+    if (!mac || !strictMacRe.test(mac)) {
+      return res.status(400).json({ ok: false, error: "INVALID_MAC" });
+    }
+    siteRef = validateSiteInput(req.body && req.body.site);
+    if (!siteRef) {
+      return res.status(400).json({ ok: false, error: "INVALID_SITE" });
+    }
+    const ap = normalizeOptionalApMac(req.body && req.body.ap);
+    const redirectTs = normalizeRedirectTs(req.body && req.body.redirectTs);
+    const ssid = sanitizeSsid(req.body && req.body.ssid);
+    const siteResolution = await resolveSiteId(siteRef, { requestId, route });
+    siteId = siteResolution.siteId;
+    const source = warmupSourceFor(req);
+    const warmup = startOrReuseWarmup({ siteId, mac, requestId, route, method, siteRef, ap, redirectTs, ssid, sourceKey: source.sourceKey, maskedSource: source.maskedSource });
+    if (!warmup.ok) {
+      if (warmup.retryAfterSeconds) res.set("Retry-After", String(warmup.retryAfterSeconds));
+      return res.status(429).json({ ok: false, error: warmup.error });
+    }
+    return res.json({ ok: true, state: warmup.state });
+  } catch (e) {
+    const status = publicStatusFor(e);
+    const errorCode = publicCodeFor(e);
+    logJson("error", "client_warmup.failed", {
+      requestId,
+      route,
+      method,
+      siteRef,
+      siteId,
+      maskedMac: strictMacRe.test(mac) ? maskMac(mac) : undefined,
+      durationMs: nowMs() - startedAt,
+      status,
+      errorCode,
+      activeWarmups: activeWarmupCount(),
+      warmupCacheSize: warmupCache.size
+    });
+    return res.status(status).json({ ok: false, error: errorCode });
+  }
+});
+
 app.post("/api/authorize", async (req, res) => {
   const requestId = requestIdFor(req);
   res.set("X-Request-ID", requestId);
@@ -538,6 +853,29 @@ app.post("/api/authorize", async (req, res) => {
   let clientLookupSlowAttempts = null;
   let clientLookupDurationMs = null;
   let authorizeActionDurationMs = null;
+  let warmupEntryForAuthorize = null;
+
+  const assignLookupMetrics = (lookup) => {
+    clientLookupAttempts = lookup.attempts;
+    clientLookupFastAttempts = lookup.fastAttempts;
+    clientLookupSlowAttempts = lookup.slowAttempts;
+    clientLookupDurationMs = lookup.durationMs;
+  };
+
+  const logAuthorizeWarmup = (event, fields = {}) => {
+    logJson("info", event, {
+      requestId,
+      route,
+      method: req.method,
+      siteRef,
+      siteId,
+      maskedMac: maskMac(mac),
+      durationMs: nowMs() - startedAt,
+      activeWarmups: activeWarmupCount(),
+      warmupCacheSize: warmupCache.size,
+      ...fields
+    });
+  };
 
   logJson("info", "authorize.start", {
     requestId,
@@ -548,7 +886,7 @@ app.post("/api/authorize", async (req, res) => {
 
   const rateLimit = checkAuthorizeRateLimit(mac);
   if (rateLimit.limited) {
-    const validMac = /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac);
+    const validMac = strictMacRe.test(mac);
     res.set("Retry-After", String(rateLimit.retryAfterSeconds));
     logJson("info", "authorize.rate_limited", {
       requestId,
@@ -567,7 +905,7 @@ app.post("/api/authorize", async (req, res) => {
   try {
     siteRef = validateSiteInput(req.body && req.body.site);
 
-    if (!mac || !/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac)) {
+    if (!mac || !strictMacRe.test(mac)) {
       logJson("info", "authorize.error", {
         requestId,
         route,
@@ -580,6 +918,12 @@ app.post("/api/authorize", async (req, res) => {
       return res.status(400).json({ ok: false, error: "INVALID_MAC" });
     }
 
+    const lookupWithExistingFlow = async () => {
+      const lookup = await waitForClientId(siteId, mac, { deadline, requestId, route });
+      assignLookupMetrics(lookup);
+      return lookup.clientId;
+    };
+
     if (siteRef) {
       const siteResolveStartedAt = nowMs();
       let siteResolution;
@@ -591,20 +935,49 @@ app.post("/api/authorize", async (req, res) => {
       siteId = siteResolution.siteId;
       siteCacheHit = siteResolution.cacheHit;
       siteResolveSource = siteResolution.source;
-      const lookup = await waitForClientId(siteId, mac, { deadline, requestId, route });
-      clientId = lookup.clientId;
-      clientLookupAttempts = lookup.attempts;
-      clientLookupFastAttempts = lookup.fastAttempts;
-      clientLookupSlowAttempts = lookup.slowAttempts;
-      clientLookupDurationMs = lookup.durationMs;
+
+      const warmup = getWarmupState(siteId, mac);
+      if (warmup.state === "ready") {
+        warmupEntryForAuthorize = warmup.entry;
+        clientId = warmup.entry.clientId;
+        clientLookupAttempts = warmup.entry.lookupAttempts;
+        clientLookupFastAttempts = warmup.entry.fastAttempts;
+        clientLookupSlowAttempts = warmup.entry.slowAttempts;
+        clientLookupDurationMs = warmup.entry.readyAt ? warmup.entry.readyAt - warmup.entry.startedAt : nowMs() - warmup.entry.startedAt;
+        logAuthorizeWarmup("authorize.warmup_hit", { lookupAttempts: warmup.entry.lookupAttempts, fastAttempts: warmup.entry.fastAttempts, slowAttempts: warmup.entry.slowAttempts });
+      } else if (warmup.state === "pending") {
+        logAuthorizeWarmup("authorize.warmup_pending", { lookupAttempts: warmup.entry.lookupAttempts, fastAttempts: warmup.entry.fastAttempts, slowAttempts: warmup.entry.slowAttempts });
+        const joined = await awaitWarmupWithinAuthorizeJoinBudget(warmup.entry, deadline);
+        const joinedState = getWarmupState(siteId, mac);
+        if (joined.state === "ready" && joinedState.state === "ready") {
+          warmupEntryForAuthorize = joinedState.entry;
+          clientId = joinedState.entry.clientId;
+          clientLookupAttempts = joinedState.entry.lookupAttempts;
+          clientLookupFastAttempts = joinedState.entry.fastAttempts;
+          clientLookupSlowAttempts = joinedState.entry.slowAttempts;
+          clientLookupDurationMs = joinedState.entry.readyAt ? joinedState.entry.readyAt - joinedState.entry.startedAt : nowMs() - joinedState.entry.startedAt;
+          logAuthorizeWarmup("authorize.warmup_hit", { lookupAttempts: joinedState.entry.lookupAttempts, fastAttempts: joinedState.entry.fastAttempts, slowAttempts: joinedState.entry.slowAttempts });
+        } else if (joined.state === "failed" || joinedState.state === "failed") {
+          const failedEntry = joinedState.entry || warmup.entry;
+          logAuthorizeWarmup("authorize.warmup_failed", { errorCode: "WARMUP_FAILED", lookupAttempts: failedEntry.lookupAttempts, fastAttempts: failedEntry.fastAttempts, slowAttempts: failedEntry.slowAttempts });
+          deleteWarmupEntryIfCurrent(siteId, mac, failedEntry);
+          clientId = await lookupWithExistingFlow();
+        } else {
+          logAuthorizeWarmup("authorize.warmup_deferred", { status: "pending", lookupAttempts: warmup.entry.lookupAttempts, fastAttempts: warmup.entry.fastAttempts, slowAttempts: warmup.entry.slowAttempts });
+        }
+      } else if (warmup.state === "failed") {
+        logAuthorizeWarmup("authorize.warmup_failed", { errorCode: "WARMUP_FAILED" });
+        deleteWarmupEntryIfCurrent(siteId, mac, warmup.entry);
+        clientId = await lookupWithExistingFlow();
+      } else {
+        logAuthorizeWarmup("authorize.warmup_miss");
+        clientId = await lookupWithExistingFlow();
+      }
     } else {
       const lookup = await findClientAcrossSites(mac, { deadline, requestId, route });
       siteId = lookup.siteId;
       clientId = lookup.clientId;
-      clientLookupAttempts = lookup.attempts;
-      clientLookupFastAttempts = lookup.fastAttempts;
-      clientLookupSlowAttempts = lookup.slowAttempts;
-      clientLookupDurationMs = lookup.durationMs;
+      assignLookupMetrics(lookup);
     }
 
     if (!siteId || !clientId) {
@@ -629,11 +1002,52 @@ app.post("/api/authorize", async (req, res) => {
       return res.status(404).json({ ok: false, error: "CLIENT_NOT_FOUND" });
     }
 
-    const authorizeActionStartedAt = nowMs();
+    const authorizeOnce = async (id) => {
+      const authorizeActionStartedAt = nowMs();
+      try {
+        await authorizeClient(siteId, id, authPolicyPayload(), { requestId, route, deadline });
+      } finally {
+        authorizeActionDurationMs = nowMs() - authorizeActionStartedAt;
+      }
+    };
+
     try {
-      await authorizeClient(siteId, clientId, authPolicyPayload(), { requestId, route, deadline });
-    } finally {
-      authorizeActionDurationMs = nowMs() - authorizeActionStartedAt;
+      await authorizeOnce(clientId);
+      if (warmupEntryForAuthorize) {
+        deleteWarmupEntryIfCurrent(siteId, mac, warmupEntryForAuthorize);
+        logAuthorizeWarmup("authorize.warmup_consumed", { lookupAttempts: warmupEntryForAuthorize.lookupAttempts, fastAttempts: warmupEntryForAuthorize.fastAttempts, slowAttempts: warmupEntryForAuthorize.slowAttempts });
+      }
+    } catch (e) {
+      if (!warmupEntryForAuthorize || !isStaleCachedClientError(e)) throw e;
+      deleteWarmupEntryIfCurrent(siteId, mac, warmupEntryForAuthorize);
+      logAuthorizeWarmup("authorize.warmup_stale", { status: publicStatusFor(e), errorCode: publicCodeFor(e) });
+      const lookup = await waitForClientId(siteId, mac, { deadline, requestId, route });
+      assignLookupMetrics(lookup);
+      clientId = lookup.clientId;
+      if (!clientId) {
+        logJson("info", "authorize.client_not_found", {
+          requestId,
+          route,
+          method: req.method,
+          siteRef,
+          siteId,
+          maskedMac: maskMac(mac),
+          durationMs: nowMs() - startedAt,
+          status: 404,
+          errorCode: "CLIENT_NOT_FOUND",
+          siteCacheHit,
+          siteResolveSource,
+          siteResolveDurationMs,
+          clientLookupAttempts,
+          clientLookupFastAttempts,
+          clientLookupSlowAttempts,
+          clientLookupDurationMs
+        });
+        return res.status(404).json({ ok: false, error: "CLIENT_NOT_FOUND" });
+      }
+      logAuthorizeWarmup("authorize.warmup_fresh_retry", { lookupAttempts: clientLookupAttempts, fastAttempts: clientLookupFastAttempts, slowAttempts: clientLookupSlowAttempts });
+      warmupEntryForAuthorize = null;
+      await authorizeOnce(clientId);
     }
 
     if (POST_AUTH_DELAY_MS > 0) await sleepWithDeadline(POST_AUTH_DELAY_MS, deadline);
