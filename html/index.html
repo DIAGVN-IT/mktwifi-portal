@@ -229,6 +229,33 @@
             return m && m[1] ? m[1] : "";
         }
 
+        function safeSsid(value) {
+            if (!value) return "";
+            return String(value).replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 64);
+        }
+
+        function normalizedPortalContext() {
+            const rawRedirectTs = param("t").trim();
+            const redirectTs = /^\d+$/.test(rawRedirectTs) ? Number(rawRedirectTs) : undefined;
+            return {
+                mac: (param("id") || "").trim().toLowerCase(),
+                siteRef: getSiteRefFromPath(),
+                ap: (param("ap") || "").trim().toLowerCase(),
+                redirectTs: Number.isSafeInteger(redirectTs) ? redirectTs : undefined,
+                ssid: safeSsid(param("ssid"))
+            };
+        }
+
+        function startClientWarmup() {
+            const ctx = normalizedPortalContext();
+            if (!ctx.mac || !ctx.siteRef) return;
+            fetch("/api/client-warmup", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ mac: ctx.mac, site: ctx.siteRef, ap: ctx.ap, redirectTs: ctx.redirectTs, ssid: ctx.ssid })
+            }).catch(() => null);
+        }
+
         function isIOS() {
             const ua = navigator.userAgent || "";
             return /iP(hone|ad|od)/i.test(ua);
@@ -303,8 +330,9 @@
             const dbg = document.getElementById("dbg");
             const btn = document.querySelector(".btn");
 
-            const mac = (param("id") || "").trim().toLowerCase();
-            const siteRef = getSiteRefFromPath();
+            const ctx = normalizedPortalContext();
+            const mac = ctx.mac;
+            const siteRef = ctx.siteRef;
 
             const finalUrl = "http://diag.vn/panel/tam-soat-ung-thu-toan-dien/?utm_source=offline&utm_medium=wifi-banner&utm_campaign=wellness-elite_0326";
 
@@ -355,6 +383,8 @@
                 if (btn) btn.disabled = false;
             }
         }
+
+        startClientWarmup();
     </script>
 </body>
 </html>
