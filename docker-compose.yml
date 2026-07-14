@@ -30,6 +30,7 @@ services:
     environment:
       UNIFI_BASE: "${UNIFI_BASE:?UNIFI_BASE is required}"
       UNIFI_API_KEY: "${UNIFI_API_KEY:?UNIFI_API_KEY is required}"
+      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
       UNIFI_SITE: "${UNIFI_SITE:-default}"
       POST_AUTH_DELAY_MS: "${POST_AUTH_DELAY_MS:-1500}"
       UNIFI_REQUEST_TIMEOUT_MS: "${UNIFI_REQUEST_TIMEOUT_MS:-5000}"
@@ -49,7 +50,7 @@ services:
     volumes:
       - ./config/branch-map.json:/app/branch-map.json:ro
     extra_hosts:
-      - "diag-unifi.diag.vn:192.168.5.115"
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD-SHELL", "node -e \"const http = require('http'); const req = http.get('http://127.0.0.1:3000/api/health/live', (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }); req.setTimeout(3000, () => { req.destroy(); process.exit(1); }); req.on('error', () => process.exit(1));\""]
       interval: 30s
